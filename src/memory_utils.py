@@ -57,15 +57,8 @@ def get_process_handle(pid):
         raise ctypes.WinError(ctypes.get_last_error())
     return handle
 
-def read_process_memory(process_handle, address, size=4):
-    # process_handle = kernel32.OpenProcess(
-    #     PROCESS_VM_READ | PROCESS_QUERY_INFORMATION,
-    #     False,
-    #     pid
-    # )
-    # if not process_handle:
-    #     raise ctypes.WinError(ctypes.get_last_error())
 
+def read_process_memory(process_handle, address, size=4):
     try:
         buffer = ctypes.create_string_buffer(size)
         bytes_read = ctypes.c_size_t()
@@ -77,31 +70,43 @@ def read_process_memory(process_handle, address, size=4):
                 ctypes.byref(bytes_read)
         ):
             return None
-            # raise ctypes.WinError(ctypes.get_last_error())
         return buffer.raw
-    except:
+    except Exception:
         return None
-    # finally:
-    #     kernel32.CloseHandle(process_handle)
 
 
 def read_int(handle, address):
     data = read_process_memory(handle, address, 4)
+    if data is None:
+        return None
     return int.from_bytes(data, 'little')
 
 
 def read_float(handle, address):
     data = read_process_memory(handle, address, 4)
+    if data is None:
+        return None
     return struct.unpack('<f', data)[0]
 
 
 def read_string(handle, address, max_length=100, encoding_format='utf-8'):
-    buffer = bytearray()
-    for i in range(0, max_length, 2):
-        chunk = read_process_memory(handle, address + i, 2)
-        if not chunk or chunk == b"\x00\x00":
-            break
-        buffer.extend(chunk)
+    """根据编码格式使用不同的读取和终止策略"""
+    if encoding_format in ('utf-16le', 'utf-16'):
+        # UTF-16: 每次读取2字节，遇到 \x00\x00 终止
+        buffer = bytearray()
+        for i in range(0, max_length, 2):
+            chunk = read_process_memory(handle, address + i, 2)
+            if not chunk or chunk == b"\x00\x00":
+                break
+            buffer.extend(chunk)
+    else:
+        # UTF-8: 每次读取1字节，遇到 \x00 终止
+        buffer = bytearray()
+        for i in range(max_length):
+            chunk = read_process_memory(handle, address + i, 1)
+            if not chunk or chunk == b"\x00":
+                break
+            buffer.extend(chunk)
     try:
         return buffer.decode(encoding_format)
     except UnicodeDecodeError:
@@ -118,6 +123,10 @@ def scan_memory_bytes(handle, pattern_bytes):
     while True:
         # 查询内存区域信息
         if not VirtualQueryEx(handle, address, ctypes.byref(mbi), ctypes.sizeof(mbi)):
+            break
+
+        # 防止 RegionSize 为 0 导致无限循环
+        if mbi.RegionSize == 0:
             break
 
         if mbi.Protect & PAGE_READWRITE and mbi.State == 0x1000:  # MEM_COMMIT
@@ -147,4 +156,3 @@ def scan_memory_bytes(handle, pattern_bytes):
             break
 
     return found_addresses
-

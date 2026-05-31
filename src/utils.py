@@ -1,6 +1,8 @@
 import win32gui
 import re
 import random
+import string
+
 
 def switch_window(window_title):
     def enum_windows_proc(hwnd, window_title):
@@ -24,6 +26,7 @@ def window_exists(window_title):
             if window_text.startswith(window_title):
                 found = True
                 return False
+        return True  # 必须显式返回 True 以继续枚举
 
     win32gui.EnumWindows(enum_windows_proc, None)
 
@@ -36,6 +39,4 @@ def contains_korean(text):
 
 
 def generate_random_string(length):
-    characters = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9']
-    random_string = ''.join(random.choice(characters) for i in range(length))
-    return random_string
+    return ''.join(random.choices(string.digits, k=length))

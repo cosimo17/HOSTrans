@@ -1,4 +1,4 @@
-from PyQt5.QtWidgets import (QApplication, QMainWindow, QSlider, QVBoxLayout,
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QVBoxLayout,
                              QWidget, QLabel, QPushButton, QListWidget)
 from PyQt5.QtGui import QColor, QPainter, QBrush, QPen
 from PyQt5.QtCore import QObject, pyqtSignal
@@ -6,9 +6,9 @@ from PyQt5.QtCore import Qt, QTimer
 import pyautogui
 import time
 import sys
+from collections import deque
 from translator import create_translator
 from utils import window_exists, contains_korean, generate_random_string
-import os
 from memory_utils import read_string, get_process_id, get_process_handle, scan_memory_bytes, CloseHandle
 import keyboard
 from qss_style import list_widget_style, main_style, title_label_style
@@ -27,8 +27,15 @@ class GlobalHotkey(QObject):
     def _on_trigger(self):
         self.triggered.emit()
 
+    def unregister(self):
+        """显式注销快捷键，避免依赖 __del__"""
+        try:
+            keyboard.remove_hotkey(self.hotkey)
+        except Exception:
+            pass
+
     def __del__(self):
-        keyboard.remove_hotkey(self.hotkey)
+        self.unregister()
 
 
 class HotKey(object):
@@ -36,7 +43,11 @@ class HotKey(object):
         self.key = key
 
     def run(self):
-        pyautogui.hotkey(self.key)
+        # 区分元组和字符串：元组需要解包为多个参数
+        if isinstance(self.key, (tuple, list)):
+            pyautogui.hotkey(*self.key)
+        else:
+            pyautogui.hotkey(self.key)
         time.sleep(0.4)
 
 
@@ -45,17 +56,17 @@ class TransparentWindow(QMainWindow):
         super().__init__()
 
         self.init_ui()
+        self.hotkeys = []  # 保存快捷键对象引用，防止被GC回收
         self.register_hotkey()
         self.init_timer()
 
-        self.count = 0
         self.my_last_msg = ''
         self.address = None
         self.pid = None
         self.init_state = False
-        self.candidate_address = None
         self.hided = False
-        self.msg_list = []
+        self.msg_list = deque(maxlen=100)  # 限制最大长度，防止无限增长
+        self.last_status_msg = ''  # 用于状态消息去重
 
         self.old_pos = None
         self.handle = None
@@ -103,12 +114,16 @@ class TransparentWindow(QMainWindow):
         self.scan_timer.timeout.connect(self.scan_memory)
         self.scan_timer.start(1000)
 
+        # 使用 singleShot 模式，避免隐藏后仍重复触发
         self.hide_win_timer = QTimer(self)
+        self.hide_win_timer.setSingleShot(True)
         self.hide_win_timer.timeout.connect(self.hide_win)
         self.hide_win_timer.start(4500)
 
     def get_translator(self):
         self.trans = create_translator()
+        if self.trans is None:
+            print("警告: 未找到 baiduAPI.txt 或配置无效，翻译功能不可用")
 
     def hide_win(self):
         if self.hided:
@@ -125,18 +140,22 @@ class TransparentWindow(QMainWindow):
         self.hide_win_timer.start(4500)
 
     def register_hotkey(self):
-        # 中译韩文
-        hotkey = GlobalHotkey("ctrl+p")
-        hotkey.triggered.connect(self.auto_trans)
+        # 将快捷键对象存储到列表中，防止被垃圾回收
+        hk_trans = GlobalHotkey("ctrl+p")
+        hk_trans.triggered.connect(self.auto_trans)
+        self.hotkeys.append(hk_trans)
 
-        hotkey = GlobalHotkey("ctrl+l")
-        hotkey.triggered.connect(self.switch_lan)
+        hk_switch = GlobalHotkey("ctrl+l")
+        hk_switch.triggered.connect(self.switch_lan)
+        self.hotkeys.append(hk_switch)
 
-        hotkey = GlobalHotkey("ctrl+1")
-        hotkey.triggered.connect(self.locate_memory_region)
+        hk_locate = GlobalHotkey("ctrl+1")
+        hk_locate.triggered.connect(self.locate_memory_region)
+        self.hotkeys.append(hk_locate)
 
-        hotkey = GlobalHotkey("ctrl+tab")
-        hotkey.triggered.connect(self.reshow)
+        hk_reshow = GlobalHotkey("ctrl+tab")
+        hk_reshow.triggered.connect(self.reshow)
+        self.hotkeys.append(hk_reshow)
 
     def set_opacity(self, value):
         self.opacity = value
@@ -148,7 +167,6 @@ class TransparentWindow(QMainWindow):
         painter.setRenderHint(QPainter.Antialiasing)
 
         # 设置背景颜色和透明度
-        # color = QColor(50, 50, 50, int(255 * (self.opacity / 100)))
         color = QColor(100, 100, 200, int(255 * (self.opacity / 100)))
         painter.setBrush(QBrush(color))
         painter.setPen(QPen(Qt.NoPen))
@@ -172,15 +190,20 @@ class TransparentWindow(QMainWindow):
             self.list_widget.takeItem(0)
         self.list_widget.scrollToBottom()
 
+    def add_status_msg(self, msg):
+        """添加状态消息（自动去重，避免刷屏）"""
+        if msg == self.last_status_msg:
+            return
+        self.last_status_msg = msg
+        self.add_msg(msg)
+
     def send_random_chat_msg(self):
         enter = HotKey('enter')
-        paste = HotKey(('ctrl', 'v'))
         random_chat_msg = generate_random_string(12)
         enter.run()
         for char in random_chat_msg:
             hk = HotKey(char)
             hk.run()
-        # paste.run()
         enter.run()
         time.sleep(1)
         return random_chat_msg
@@ -221,7 +244,15 @@ class TransparentWindow(QMainWindow):
     def auto_trans(self):
         if not window_exists("《风暴英雄》"):
             return
+        if self.trans is None:
+            self.add_msg('翻译器未初始化，请检查 baiduAPI.txt')
+            return
         self.hide_win_timer.stop()
+
+        # 保存剪贴板原始内容
+        clipboard = QApplication.clipboard()
+        original_clipboard = clipboard.text()
+
         select_all = HotKey(('ctrl', 'a'))
         copy = HotKey(('ctrl', 'c'))
         paste = HotKey(('ctrl', 'v'))
@@ -230,9 +261,10 @@ class TransparentWindow(QMainWindow):
             time.sleep(0.01)
             copy.run()
             time.sleep(0.01)
-        clipboard = QApplication.clipboard()
         chinese_text = clipboard.text()
         if not chinese_text:
+            # 恢复剪贴板
+            clipboard.setText(original_clipboard)
             return
         foreign_text = self.trans.trans(chinese_text, toLang=self.target_lan, fromLang='zh')
         clipboard.setText(foreign_text)
@@ -242,15 +274,23 @@ class TransparentWindow(QMainWindow):
             paste.run()
             time.sleep(0.01)
 
+        # 恢复剪贴板原始内容
+        clipboard.setText(original_clipboard)
+
     def scan_memory(self):
         if not window_exists("《风暴英雄》"):
-            self.add_msg('游戏未启动')
+            self.add_status_msg('游戏未启动')
             self.reshow()
             return
         if not self.init_state:
             return
+        if self.trans is None:
+            return
+        # 清除状态消息去重标记（游戏已启动，下次未启动时应再次提示）
+        self.last_status_msg = ''
+
         text = read_string(self.handle, self.address, 200, self.encoding_format)
-        if text is None:
+        if text is None or len(text) == 0:
             return
         sys_msgs = ['综合 한국어', '<c val="3184FF">[团队]:</c>', '浏览战利', '浏览收藏', '菜单']
         for sys_msg in sys_msgs:
@@ -260,17 +300,13 @@ class TransparentWindow(QMainWindow):
             if text in self.msg_list:
                 return
             ch_text = self.trans.trans(text, toLang='zh')
-            if len(text) == 0:
-                return
             if '翻译失败' in ch_text:
                 return
-            # if text != self.my_last_msg:
-            if True:
-                self.add_msg(text)
-                self.add_msg(ch_text)
-                self.reshow()
-                self.hide_win_timer.start(4500)  # 重置隐藏窗体倒计时
-                self.msg_list.append(text)
+            self.add_msg(text)
+            self.add_msg(ch_text)
+            self.reshow()
+            self.hide_win_timer.start(4500)  # 重置隐藏窗体倒计时
+            self.msg_list.append(text)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
@@ -286,10 +322,20 @@ class TransparentWindow(QMainWindow):
         if event.button() == Qt.LeftButton:
             self.old_pos = None
 
-    def closeEvent(self, a0):
+    def closeEvent(self, event):
+        # 停止所有定时器
+        self.scan_timer.stop()
+        self.hide_win_timer.stop()
+        # 注销所有快捷键
+        for hk in self.hotkeys:
+            hk.unregister()
+        self.hotkeys.clear()
+        # 关闭进程句柄
         if self.handle is not None:
             CloseHandle(self.handle)
-        self.close()
+            self.handle = None
+        # 接受关闭事件（而非调用 self.close() 导致无限递归）
+        event.accept()
 
 
 if __name__ == "__main__":

@@ -38,10 +38,14 @@ class BaiduTranslator(object):
 
 
 def create_translator():
-    if os.path.exists('baiduAPI.txt'):
-        with open('baiduAPI.txt', 'r') as f:
+    # 使用 __file__ 定位配置文件，避免依赖工作目录
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    api_file = os.path.join(base_dir, 'baiduAPI.txt')
+    if os.path.exists(api_file):
+        with open(api_file, 'r') as f:
             lines = f.readlines()
-            lines = [l.replace('\n', '') for l in lines]
-            appid, secretkey = lines[:2]
-            return BaiduTranslator(appid, secretkey)
+            lines = [l.strip() for l in lines if l.strip()]
+            if len(lines) >= 2:
+                appid, secretkey = lines[:2]
+                return BaiduTranslator(appid, secretkey)
     return None
