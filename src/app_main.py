@@ -1,13 +1,12 @@
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QVBoxLayout,
                              QWidget, QLabel, QPushButton, QListWidget)
 from PyQt5.QtGui import QColor, QPainter, QBrush, QPen
-from PyQt5.QtCore import QObject, pyqtSignal
-from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtCore import QObject, pyqtSignal, Qt, QTimer, QRunnable, QThreadPool
 import pyautogui
 import time
 import sys
 from collections import deque
-from translator import create_translator
+from translator import create_translator, BaseTranslator
 from utils import window_exists, contains_korean, generate_random_string
 from memory_utils import read_string, get_process_id, get_process_handle, scan_memory_bytes, CloseHandle
 import keyboard
@@ -51,6 +50,27 @@ class HotKey(object):
         time.sleep(0.4)
 
 
+class TranslationSignals(QObject):
+    """异步翻译任务信号载体"""
+    finished = pyqtSignal(str, str)
+
+
+class TranslationTask(QRunnable):
+    """基于 Qt 线程池的异步翻译工作任务"""
+
+    def __init__(self, translator: BaseTranslator, src_text: str, from_lang: str = 'auto', to_lang: str = 'zh'):
+        super().__init__()
+        self.translator = translator
+        self.src_text = src_text
+        self.from_lang = from_lang
+        self.to_lang = to_lang
+        self.signals = TranslationSignals()
+
+    def run(self):
+        dst_text = self.translator.trans(self.src_text, fromLang=self.from_lang, toLang=self.to_lang)
+        self.signals.finished.emit(self.src_text, dst_text)
+
+
 class TransparentWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -71,6 +91,9 @@ class TransparentWindow(QMainWindow):
         self.old_pos = None
         self.handle = None
         self.encoding_format = 'utf-8'
+        self.thread_pool = QThreadPool.globalInstance()
+        self._active_tasks = set()  # 保存执行中的异步任务引用，防止提前被GC回收
+        self.is_translating_input = False  # 防止输入框翻译重入
         self.get_translator()
         self.target_lan = 'kor'
 
@@ -123,7 +146,7 @@ class TransparentWindow(QMainWindow):
     def get_translator(self):
         self.trans = create_translator()
         if self.trans is None:
-            print("警告: 未找到 baiduAPI.txt 或配置无效，翻译功能不可用")
+            print("警告: 翻译器初始化失败，请检查 config.ini 或 baiduAPI.txt 配置")
 
     def hide_win(self):
         if self.hided:
@@ -245,7 +268,9 @@ class TransparentWindow(QMainWindow):
         if not window_exists("《风暴英雄》"):
             return
         if self.trans is None:
-            self.add_msg('翻译器未初始化，请检查 baiduAPI.txt')
+            self.add_msg('翻译器未初始化，请检查 config.ini 配置')
+            return
+        if self.is_translating_input:
             return
         self.hide_win_timer.stop()
 
@@ -255,7 +280,6 @@ class TransparentWindow(QMainWindow):
 
         select_all = HotKey(('ctrl', 'a'))
         copy = HotKey(('ctrl', 'c'))
-        paste = HotKey(('ctrl', 'v'))
         for _ in range(2):
             select_all.run()
             time.sleep(0.01)
@@ -266,9 +290,28 @@ class TransparentWindow(QMainWindow):
             # 恢复剪贴板
             clipboard.setText(original_clipboard)
             return
-        foreign_text = self.trans.trans(chinese_text, toLang=self.target_lan, fromLang='zh')
+
+        self.is_translating_input = True
+        task = TranslationTask(self.trans, chinese_text, from_lang='zh', to_lang=self.target_lan)
+        self._active_tasks.add(task)
+        task.signals.finished.connect(
+            lambda src, dst, orig=original_clipboard, t=task: self._on_auto_trans_finished(dst, orig, t)
+        )
+        self.thread_pool.start(task)
+
+    def _on_auto_trans_finished(self, foreign_text: str, original_clipboard: str, task: TranslationTask):
+        self._active_tasks.discard(task)
+        self.is_translating_input = False
+        clipboard = QApplication.clipboard()
+        if not foreign_text or '翻译失败' in foreign_text:
+            clipboard.setText(original_clipboard)
+            self.add_msg('输入翻译失败，请检查网络或 API 配置')
+            return
+
         clipboard.setText(foreign_text)
         self.my_last_msg = foreign_text
+        select_all = HotKey(('ctrl', 'a'))
+        paste = HotKey(('ctrl', 'v'))
         for _ in range(2):
             select_all.run()
             paste.run()
@@ -299,14 +342,24 @@ class TransparentWindow(QMainWindow):
         if contains_korean(text) and text != self.my_last_msg:
             if text in self.msg_list:
                 return
-            ch_text = self.trans.trans(text, toLang='zh')
-            if '翻译失败' in ch_text:
-                return
-            self.add_msg(text)
-            self.add_msg(ch_text)
-            self.reshow()
-            self.hide_win_timer.start(4500)  # 重置隐藏窗体倒计时
             self.msg_list.append(text)
+            task = TranslationTask(self.trans, text, from_lang='auto', to_lang='zh')
+            self._active_tasks.add(task)
+            task.signals.finished.connect(
+                lambda src, dst, t=task: self._on_scan_trans_finished(src, dst, t)
+            )
+            self.thread_pool.start(task)
+
+    def _on_scan_trans_finished(self, src_text: str, ch_text: str, task: TranslationTask):
+        self._active_tasks.discard(task)
+        if not ch_text or '翻译失败' in ch_text:
+            if src_text in self.msg_list:
+                self.msg_list.remove(src_text)
+            return
+        self.add_msg(src_text)
+        self.add_msg(ch_text)
+        self.reshow()
+        self.hide_win_timer.start(4500)  # 重置隐藏窗体倒计时
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
