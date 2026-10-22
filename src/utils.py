@@ -1,7 +1,11 @@
+import base64
+import io
 import win32gui
 import re
 import random
 import string
+from typing import Tuple
+import pyautogui
 
 
 def switch_window(window_title):
@@ -40,3 +44,18 @@ def contains_korean(text):
 
 def generate_random_string(length):
     return ''.join(random.choices(string.digits, k=length))
+
+
+def capture_chat_region_base64(ratios: Tuple[float, float, float, float]) -> str:
+    """根据相对屏幕分辨率的硬编码偏移比例截取局部屏幕，并返回 PNG 的 Base64 字符串"""
+    screen_w, screen_h = pyautogui.size()
+    x_ratio, y_ratio, w_ratio, h_ratio = ratios
+    left = max(0, int(screen_w * x_ratio))
+    top = max(0, int(screen_h * y_ratio))
+    width = max(1, int(screen_w * w_ratio))
+    height = max(1, int(screen_h * h_ratio))
+
+    screenshot = pyautogui.screenshot(region=(left, top, width, height))
+    buffer = io.BytesIO()
+    screenshot.save(buffer, format='PNG')
+    return base64.b64encode(buffer.getvalue()).decode('utf-8')

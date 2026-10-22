@@ -8,13 +8,17 @@ import time
 import urllib.parse
 import urllib.request
 import uuid
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict, Tuple, List
 
 from config import (
     TRANSLATOR_CONFIG_FILE,
     BAIDU_API_CONFIG_FILE,
     DEFAULT_TRANSLATOR_PROVIDER,
     DEFAULT_REQUEST_TIMEOUT,
+    DEFAULT_LLM_BASE_URL,
+    DEFAULT_LLM_MODEL,
+    DEFAULT_LLM_TIMEOUT,
+    LLM_VISION_PROMPT,
 )
 
 
@@ -301,3 +305,140 @@ def create_translator(config_path: Optional[str] = None) -> Optional[BaseTransla
     else:
         print(f"未知的翻译平台配置: {provider}")
         return None
+
+
+class LLMVisionTranslator:
+    """基于 OpenAI 兼容格式的多模态 LLM 截图理解与翻译器"""
+
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str,
+        model: str,
+        timeout: float = DEFAULT_LLM_TIMEOUT,
+        prompt: str = LLM_VISION_PROMPT,
+    ):
+        base = base_url.strip().rstrip('/')
+        if base.endswith('/chat/completions'):
+            self.api_url = base
+        else:
+            self.api_url = f"{base}/chat/completions"
+        self.api_key = api_key.strip()
+        self.model = model.strip()
+        self.timeout = timeout
+        self.prompt = prompt
+
+    @staticmethod
+    def _parse_json_response(content: str) -> List[Dict[str, str]]:
+        """解析 LLM 返回的 JSON 文本，提取 messages 列表"""
+        text = content.strip()
+        if text.startswith('```'):
+            lines = text.splitlines()
+            if lines and lines[0].startswith('```'):
+                lines = lines[1:]
+            if lines and lines[-1].strip().startswith('```'):
+                lines = lines[:-1]
+            text = '\n'.join(lines).strip()
+
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            start = text.find('{')
+            end = text.rfind('}')
+            if start != -1 and end != -1 and end > start:
+                data = json.loads(text[start:end + 1])
+            else:
+                raise
+
+        raw_messages = data.get('messages', []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+        parsed: List[Dict[str, str]] = []
+        for item in raw_messages:
+            if not isinstance(item, dict):
+                continue
+            sender = str(item.get('sender', '') or '').strip()
+            src = str(item.get('src', '') or '').strip()
+            dst = str(item.get('dst', '') or '').strip()
+            if src or dst:
+                parsed.append({'sender': sender, 'src': src, 'dst': dst})
+        return parsed
+
+    def trans_image(self, image_base64: str) -> List[Dict[str, str]]:
+        """发送截图 Base64 与预设提示词到 LLM API，返回解析后的消息列表"""
+        if not image_base64:
+            return []
+
+        payload = {
+            'model': self.model,
+            'messages': [
+                {
+                    'role': 'user',
+                    'content': [
+                        {'type': 'text', 'text': self.prompt},
+                        {
+                            'type': 'image_url',
+                            'image_url': {
+                                'url': f'data:image/png;base64,{image_base64}',
+                            },
+                        },
+                    ],
+                }
+            ],
+            'temperature': 0.1,
+        }
+
+        data = json.dumps(payload).encode('utf-8')
+        headers = {
+            'Content-Type': 'application/json',
+            'Authorization': f'Bearer {self.api_key}',
+            'User-Agent': 'HOSTrans/1.0',
+        }
+        req = urllib.request.Request(self.api_url, data=data, headers=headers, method='POST')
+        with urllib.request.urlopen(req, timeout=self.timeout) as response:
+            result = json.loads(response.read().decode('utf-8'))
+
+        choices = result.get('choices', [])
+        if not choices:
+            raise ValueError('LLM 响应中未包含 choices 字段')
+        content = choices[0].get('message', {}).get('content', '')
+        if not content:
+            return []
+        return self._parse_json_response(content)
+
+
+def create_llm_translator(config_path: Optional[str] = None) -> Optional[LLMVisionTranslator]:
+    """根据配置文件 [llm] 节创建多模态 LLM 翻译器实例"""
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    if config_path is None:
+        config_path = os.path.join(base_dir, TRANSLATOR_CONFIG_FILE)
+
+    parser = configparser.ConfigParser()
+    if os.path.exists(config_path):
+        try:
+            parser.read(config_path, encoding='utf-8')
+        except Exception as e:
+            print(f"读取配置文件 {config_path} 失败: {e}")
+            return None
+    else:
+        return None
+
+    if not parser.has_section('llm'):
+        return None
+
+    base_url = parser.get('llm', 'base_url', fallback=DEFAULT_LLM_BASE_URL).strip()
+    api_key = parser.get('llm', 'api_key', fallback='').strip()
+    model = parser.get('llm', 'model', fallback=DEFAULT_LLM_MODEL).strip()
+    try:
+        timeout = float(parser.get('llm', 'timeout', fallback=str(DEFAULT_LLM_TIMEOUT)))
+    except ValueError:
+        timeout = DEFAULT_LLM_TIMEOUT
+
+    if not (base_url and api_key and model):
+        return None
+
+    return LLMVisionTranslator(
+        base_url=base_url,
+        api_key=api_key,
+        model=model,
+        timeout=timeout,
+    )
+

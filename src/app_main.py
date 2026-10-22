@@ -6,8 +6,9 @@ import pyautogui
 import time
 import sys
 from collections import deque
-from translator import create_translator, BaseTranslator
-from utils import window_exists, contains_korean, generate_random_string
+from config import CHAT_REGION_RATIOS, HOTKEY_VISION_TRANS
+from translator import create_translator, BaseTranslator, create_llm_translator, LLMVisionTranslator
+from utils import window_exists, contains_korean, generate_random_string, capture_chat_region_base64
 from memory_utils import read_string, get_process_id, get_process_handle, scan_memory_bytes, CloseHandle
 import keyboard
 from qss_style import list_widget_style, main_style, title_label_style
@@ -71,6 +72,29 @@ class TranslationTask(QRunnable):
         self.signals.finished.emit(self.src_text, dst_text)
 
 
+class VisionTranslationSignals(QObject):
+    """异步截图 LLM 翻译任务信号载体"""
+    finished = pyqtSignal(list, str)
+
+
+class VisionTranslationTask(QRunnable):
+    """基于 Qt 线程池的异步截图 LLM 理解翻译工作任务"""
+
+    def __init__(self, llm_translator: LLMVisionTranslator, image_base64: str):
+        super().__init__()
+        self.llm_translator = llm_translator
+        self.image_base64 = image_base64
+        self.signals = VisionTranslationSignals()
+
+    def run(self):
+        try:
+            messages = self.llm_translator.trans_image(self.image_base64)
+            self.signals.finished.emit(messages, '')
+        except Exception as e:
+            self.signals.finished.emit([], str(e))
+
+
+
 class TransparentWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -94,6 +118,8 @@ class TransparentWindow(QMainWindow):
         self.thread_pool = QThreadPool.globalInstance()
         self._active_tasks = set()  # 保存执行中的异步任务引用，防止提前被GC回收
         self.is_translating_input = False  # 防止输入框翻译重入
+        self.is_translating_vision = False  # 防止截图LLM翻译重入
+        self.llm_trans = None
         self.get_translator()
         self.target_lan = 'kor'
 
@@ -147,6 +173,7 @@ class TransparentWindow(QMainWindow):
         self.trans = create_translator()
         if self.trans is None:
             print("警告: 翻译器初始化失败，请检查 config.ini 或 baiduAPI.txt 配置")
+        self.llm_trans = create_llm_translator()
 
     def hide_win(self):
         if self.hided:
@@ -175,6 +202,10 @@ class TransparentWindow(QMainWindow):
         hk_locate = GlobalHotkey("ctrl+1")
         hk_locate.triggered.connect(self.locate_memory_region)
         self.hotkeys.append(hk_locate)
+
+        hk_vision = GlobalHotkey(HOTKEY_VISION_TRANS)
+        hk_vision.triggered.connect(self.vision_trans)
+        self.hotkeys.append(hk_vision)
 
         hk_reshow = GlobalHotkey("ctrl+tab")
         hk_reshow.triggered.connect(self.reshow)
@@ -360,6 +391,66 @@ class TransparentWindow(QMainWindow):
         self.add_msg(ch_text)
         self.reshow()
         self.hide_win_timer.start(4500)  # 重置隐藏窗体倒计时
+
+    def vision_trans(self):
+        """快捷键触发：截取局内聊天区域并调用 LLM 理解与翻译"""
+        if not window_exists("《风暴英雄》"):
+            return
+        if self.llm_trans is None:
+            self.add_msg('LLM 未配置，请检查 config.ini 的 [llm] 配置')
+            self.reshow()
+            self.hide_win_timer.start(4500)
+            return
+        if self.is_translating_vision:
+            return
+
+        try:
+            image_b64 = capture_chat_region_base64(CHAT_REGION_RATIOS)
+        except Exception:
+            self.add_msg('局部屏幕截图失败')
+            self.reshow()
+            self.hide_win_timer.start(4500)
+            return
+
+        self.is_translating_vision = True
+        task = VisionTranslationTask(self.llm_trans, image_b64)
+        self._active_tasks.add(task)
+        task.signals.finished.connect(
+            lambda msgs, err, t=task: self._on_vision_trans_finished(msgs, err, t)
+        )
+        self.thread_pool.start(task)
+
+    def _on_vision_trans_finished(self, messages: list, error_msg: str, task: VisionTranslationTask):
+        self._active_tasks.discard(task)
+        self.is_translating_vision = False
+
+        if error_msg:
+            self.add_msg('截图翻译失败，请检查 LLM 配置或网络')
+            self.reshow()
+            self.hide_win_timer.start(4500)
+            return
+
+        if not messages:
+            self.add_msg('未识别到局内聊天内容')
+            self.reshow()
+            self.hide_win_timer.start(4500)
+            return
+
+        for item in messages:
+            sender = item.get('sender', '')
+            src = item.get('src', '')
+            dst = item.get('dst', '')
+            if sender:
+                formatted = f'[{sender}] {src} -> {dst}'
+            else:
+                formatted = f'{src} -> {dst}'
+            if formatted not in self.msg_list:
+                self.msg_list.append(formatted)
+                self.add_msg(formatted)
+
+        self.reshow()
+        self.hide_win_timer.start(4500)
+
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
